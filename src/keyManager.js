@@ -1,17 +1,13 @@
+import { generateKeyPair, exportJWK, importJWK } from 'jose';
+import { decryptText, encryptText } from './crypto.js';
+import { getAllValidKeys, getKey, insertKey } from './db.js';
 
-import crypto from 'crypto';
-import { generateKeyPair, exportJWK, importPKCS8, exportPKCS8 } from 'jose';
-import { openDb, insertKey, getKey, getAllValidKeys } from './db.js';
-
-/**
- * Represents a single RSA key pair + metadata.
- */
 export class KeyRecord {
   constructor ({ kid, privateKey, publicJwk, expiresAt }) {
     this.kid = kid;
-    this.privateKey = privateKey; // KeyLike
-    this.publicJwk = publicJwk; // { kty, n, e, alg, use, kid }
-    this.expiresAt = expiresAt; // Date
+    this.privateKey = privateKey;
+    this.publicJwk = publicJwk;
+    this.expiresAt = expiresAt;
   }
 
   isExpired (at = new Date()) {
@@ -19,88 +15,96 @@ export class KeyRecord {
   }
 }
 
-/**
- * Manages active and expired keys, handles expiry & rotation.
- */
-
 export class KeyManager {
-  constructor({
-    activeTtlSec = 15 * 60, // 15 minutes
-    expiredOffsetSec = -5 * 60 // expired 5 minutes ago
+  constructor ({
+    db,
+    encryptionSecret,
+    activeTtlSec = 15 * 60,
+    expiredOffsetSec = -5 * 60
   } = {}) {
+    if (!db) throw new Error('db is required');
+    if (!encryptionSecret) throw new Error('NOT_MY_KEY must be configured');
+
+    this.db = db;
+    this.encryptionSecret = encryptionSecret;
     this.activeTtlSec = activeTtlSec;
     this.expiredOffsetSec = expiredOffsetSec;
-    this.db = null;
   }
 
-
-  async init() {
-    this.db = await openDb();
-    // Ensure at least one active and one expired key exist in DB
+  async init () {
     await this._ensureActiveKey();
     await this._ensureExpiredKey();
   }
 
-
-  stop() {
-    // No-op for DB version
+  stop () {
+    // No periodic timer in DB-backed manager.
   }
 
+  async _createKey (expiresInSec) {
+    const { privateKey } = await generateKeyPair('RS256', { modulusLength: 2048 });
+    const privateJwk = await exportJWK(privateKey);
 
-  async _createKey(expiresInSec) {
-    const { publicKey, privateKey } = await generateKeyPair('RS256', { modulusLength: 2048 });
-    const pem = await exportPKCS8(privateKey);
     const exp = Math.floor((Date.now() + (expiresInSec * 1000)) / 1000);
-    await insertKey(this.db, pem, exp);
+    const encryptedPayload = encryptText(JSON.stringify(privateJwk), this.encryptionSecret);
+    await insertKey(this.db, encryptedPayload, exp);
   }
 
-
-  async _ensureActiveKey() {
-    const key = await getKey(this.db, false);
-    if (!key) {
+  async _ensureActiveKey () {
+    const active = await getKey(this.db, false);
+    if (!active) {
       await this._createKey(this.activeTtlSec);
     }
   }
 
-  async _ensureExpiredKey() {
-    const key = await getKey(this.db, true);
-    if (!key) {
+  async _ensureExpiredKey () {
+    const expired = await getKey(this.db, true);
+    if (!expired) {
       await this._createKey(this.expiredOffsetSec);
     }
   }
 
+  async _rowToKeyRecord (row) {
+    const decrypted = decryptText(row.key, this.encryptionSecret);
+    const privateJwk = JSON.parse(decrypted);
+    const privateKey = await importJWK(privateJwk, 'RS256');
 
-  async getSigningKey() {
-    const keyRow = await getKey(this.db, false);
-    if (!keyRow) throw new Error('No valid signing key found');
-    return this._rowToKeyRecord(keyRow);
+    const publicJwk = {
+      kty: 'RSA',
+      n: privateJwk.n,
+      e: privateJwk.e,
+      use: 'sig',
+      alg: 'RS256',
+      kid: String(row.kid)
+    };
+
+    return new KeyRecord({
+      kid: String(row.kid),
+      privateKey,
+      publicJwk,
+      expiresAt: new Date(row.exp * 1000)
+    });
   }
 
-  async getExpiredSigningKey() {
-    const keyRow = await getKey(this.db, true);
-    if (!keyRow) throw new Error('No expired signing key found');
-    return this._rowToKeyRecord(keyRow);
+  async getSigningKey () {
+    await this._ensureActiveKey();
+    const row = await getKey(this.db, false);
+    if (!row) throw new Error('No valid signing key found');
+    return this._rowToKeyRecord(row);
   }
 
-  async getActiveJWKS() {
+  async getExpiredSigningKey () {
+    await this._ensureExpiredKey();
+    const row = await getKey(this.db, true);
+    if (!row) throw new Error('No expired signing key found');
+    return this._rowToKeyRecord(row);
+  }
+
+  async getActiveJWKS () {
     const rows = await getAllValidKeys(this.db);
     const keys = await Promise.all(rows.map(async row => {
       const rec = await this._rowToKeyRecord(row);
       return rec.publicJwk;
     }));
     return { keys };
-  }
-
-  async _rowToKeyRecord(row) {
-    // row: { kid, key, exp }
-    const privateKey = await importPKCS8(row.key, 'RS256');
-    // For JWKS, we need the public JWK. We'll re-export from privateKey.
-    const publicJwk = await exportJWK(privateKey);
-    publicJwk.kty = publicJwk.kty || 'RSA';
-    publicJwk.use = 'sig';
-    publicJwk.alg = 'RS256';
-    publicJwk.kid = String(row.kid);
-    const expiresAt = new Date(row.exp * 1000);
-    return new KeyRecord({ kid: String(row.kid), privateKey, publicJwk, expiresAt });
   }
 }
